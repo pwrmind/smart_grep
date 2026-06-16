@@ -1,4 +1,3 @@
-import os
 import sys
 import datetime
 import re
@@ -7,158 +6,205 @@ import ollama
 
 MODEL_NAME = "gemma4:e4b-it-q4_K_M"
 
-def get_word_stem(word: str) -> str:
-    """Очищает слово и оставляет его основу (удаляет окончания/суффиксы)"""
-    word = "".join(c for c in word if c.isalpha()).lower().strip()
-    if len(word) <= 3:
-        return word
-    
-    # Регулярное выражение для типичных русских окончаний
-    rv_re = re.compile(r'(ами|ями|ов|ев|ей|ия|ие|ию|я|а|е|и|о|у|ы|ь|ия|ьях|ых|их|ого|ому|ыми|ными|ческий|ческая|ческое|ских|ского|скому|скими|ской)$')
-    stem = rv_re.sub('', word)
-    
-    if len(stem) > 5:
-        stem = re.sub(r'(ани|ени|ств|ни|тель|ова|ива)$', '', stem)
-        
-    return stem if len(stem) >= 3 else word
+# ---------- Лемматизация (pymorphy2 или стеммер) ----------
+try:
+    import pymorphy2
+    try:
+        import pymorphy2_dicts_ru
+        dict_path = Path(pymorphy2_dicts_ru.__path__[0]) / 'data'
+        morph = pymorphy2.MorphAnalyzer(path=str(dict_path))
+    except ImportError:
+        morph = pymorphy2.MorphAnalyzer()
+    USE_PYMORPHY = True
+except Exception:
+    USE_PYMORPHY = False
+    def get_word_stem(word: str) -> str:
+        word = "".join(c for c in word if c.isalpha()).lower().strip()
+        if len(word) <= 3:
+            return word
+        rv_re = re.compile(r'(ами|ями|ов|ев|ей|ия|ие|ию|я|а|е|и|о|у|ы|ь|ия|ьях|ых|их|ого|ому|ыми|ными|ческий|ческая|ческое|ских|ского|скому|скими|ской)$')
+        stem = rv_re.sub('', word)
+        if len(stem) > 5:
+            stem = re.sub(r'(ани|ени|ств|ни|тель|ова|ива)$', '', stem)
+        return stem if len(stem) >= 3 else word
 
-def get_search_keywords(user_query: str) -> list:
-    """Просим Gemma выделить важные слова. Никакого JSON, только текст через запятую."""
+STOP_LEMMAS = {
+    'я', 'ты', 'он', 'она', 'оно', 'мы', 'вы', 'они',
+    'что', 'как', 'где', 'когда', 'почему', 'зачем',
+    'этот', 'тот', 'весь', 'наш', 'ваш', 'свой',
+    'мочь', 'рассказать', 'лекция', 'который'
+}
+
+def lemmatize_word(word: str) -> str | None:
+    word = word.strip().lower()
+    if not word or len(word) < 3:
+        return None
+    if re.search(r'\d', word):
+        return None
+    if USE_PYMORPHY:
+        try:
+            normal = morph.parse(word)[0].normal_form
+        except Exception:
+            return None
+    else:
+        normal = get_word_stem(word)
+        if not normal or len(normal) < 3:
+            return None
+    if normal in STOP_LEMMAS:
+        return None
+    return normal
+
+def lemmatize_text(text: str) -> list[str]:
+    words = re.findall(r'[а-яёa-z]+', text, re.IGNORECASE)
+    lemmas = []
+    for w in words:
+        l = lemmatize_word(w)
+        if l:
+            lemmas.append(l)
+    return lemmas
+
+# ---------- Ключевые слова моделью ----------
+def get_search_keywords(user_query: str) -> list[str]:
     prompt = f"""Проанализируй вопрос пользователя. Выдели из него от 2 до 4 главных одиночных слов для поиска информации (существительные или глаголы в начальной форме).
 Игнорируй предлоги и общие слова (что, как, где, расскажи, лекция).
 Выведи ТОЛЬКО эти слова через запятую. Больше ничего не пиши.
 
 Вопрос: "{user_query}"
 Пример вывода: выгорание, профилактика, психолог"""
-    
+
     try:
         response = ollama.generate(model=MODEL_NAME, prompt=prompt, options={"temperature": 0.1})
-        raw_text = response['response'].strip()
-        
-        # Защита от включенного режима рассуждения (Thinking/Thought) у Gemma
-        if "</thought>" in raw_text:
-            raw_text = raw_text.split("</thought>")[-1].strip()
-        elif "</thinking>" in raw_text:
-            raw_text = raw_text.split("</thinking>")[-1].strip()
+        raw = response['response'].strip()
+        for tag in ("</thought>", "</thinking>"):
+            if tag in raw:
+                raw = raw.split(tag)[-1].strip()
+        raw_words = re.split(r'[,\s.\-+]+', raw)
+        lemmas = []
+        for w in raw_words:
+            l = lemmatize_word(w)
+            if l:
+                lemmas.append(l)
+        return lemmas[:4]
+    except Exception:
+        return lemmatize_text(user_query)[:4]
 
-        # Разбиваем строку по запятым, пробелам или дефисам
-        words = re.split(r'[,\s\n\.\-\+]+', raw_text)
-        
-        stems = set()
-        for w in words:
-            stem = get_word_stem(w)
-            if len(stem) >= 3:
-                stems.add(stem)
-                
-        return list(stems)
-    except Exception as e:
-        # Если Ollama упала, делаем тупой, но надежный разбор самой строки пользователя
-        return list({get_word_stem(w) for w in user_query.split() if len(w) > 3})
-
-def search_files(kb_path: Path, stems: list) -> str:
-    """Ищет пересечения основ слов (Умный grep)"""
-    if not stems:
+# ---------- Поиск (улучшен) ----------
+def search_files(kb_path: Path, query_lemmas: list[str], top_n=5) -> str:
+    if not query_lemmas:
         return ""
-        
-    found_segments = []
-    
+
+    found = []
+
     for file_path in kb_path.rglob('*'):
-        if file_path.suffix.lower() in ['.md', '.txt'] and file_path.is_file():
-            # Пропускаем служебные файлы нашей истории
-            if ".chat_history" in file_path.parts:
-                continue
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    lines = f.readlines()
-                
-                for idx, line in enumerate(lines):
-                    line_lower = line.lower()
-                    
-                    # Считаем сколько основ слов встретилось в строке
-                    matches_count = sum(1 for stem in stems if stem in line_lower)
-                    
-                    # Если ищем 1-2 слова — достаточно 1 совпадения. 
-                    # Если ищем 3+ слов — нужно минимум 2 совпадения в одной строке, чтобы не спамить.
-                    required = 1 if len(stems) <= 2 else 2
-                    
-                    if matches_count >= required:
-                        start = max(0, idx - 2)
-                        end = min(len(lines), idx + 3)
-                        context = "".join(lines[start:end]).strip()
-                        
-                        # Сохраняем кортеж: (кол-во совпадений, текст фрагмента)
-                        found_segments.append((matches_count, f"Файл: {file_path.name} (Строка {idx+1}):\n{context}\n---"))
-            except Exception:
+        if file_path.suffix.lower() not in ['.md', '.txt']:
+            continue
+        if not file_path.is_file() or ".chat_history" in file_path.parts:
+            continue
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+        except Exception:
+            continue
+
+        # Заголовок файла (первые 3 строки) – для контекста
+        file_header = "".join(lines[:3]).strip() if len(lines) >= 3 else ""
+
+        for idx, line in enumerate(lines):
+            line_lemmas = lemmatize_text(line)
+            if not line_lemmas:
                 continue
 
-    # Сортируем по количеству совпадений (релевантности) от большего к меньшему
-    found_segments.sort(key=lambda x: x[0], reverse=True)
-    
-    # Возвращаем только текст топ-15 результатов
-    return "\n\n".join([item[1] for item in found_segments[:15]])
+            matched = set()
+            for q_lemma in query_lemmas:
+                if re.search(r'\b' + re.escape(q_lemma) + r'\b', ' '.join(line_lemmas)):
+                    matched.add(q_lemma)
+            if not matched:
+                continue
 
+            score = len(matched)
+            # Увеличиваем окно до ±5 строк
+            start = max(0, idx - 5)
+            end = min(len(lines), idx + 6)
+            snippet = "".join(lines[start:end]).strip()
+
+            # Добавляем заголовок файла, чтобы модель понимала источник
+            full_context = f"Файл: {file_path.name}\nЗаголовок: {file_header}\n---\n{snippet}"
+            found.append((score, full_context))
+
+    found.sort(key=lambda x: x[0], reverse=True)
+    top_frags = [f"Фрагмент {i+1}:\n{text}\n---" for i, (_, text) in enumerate(found[:top_n])]
+    return "\n\n".join(top_frags)
+
+# ---------- История ----------
 def save_chat_history(kb_path: Path, user_query: str, ai_response: str):
-    """Сохраняем логи диалога"""
-    history_dir = kb_path / ".chat_history"
-    history_dir.mkdir(exist_ok=True)
+    hist_dir = kb_path / ".chat_history"
+    hist_dir.mkdir(exist_ok=True)
     date_str = datetime.datetime.now().strftime("%Y-%m-%d")
-    history_file = history_dir / f"chat_{date_str}.md"
-    
+    hist_file = hist_dir / f"chat_{date_str}.md"
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-    with open(history_file, 'a', encoding='utf-8') as f:
+    with open(hist_file, 'a', encoding='utf-8') as f:
         f.write(f"### Диалог [{timestamp}]\n**Пользователь:** {user_query}\n\n**Ассистент:** {ai_response}\n\n" + "="*40 + "\n\n")
 
+# ---------- Главный цикл ----------
 def main():
     if len(sys.argv) < 2:
         print("Использование: uv run main.py 'C:\\путь\\к\\базе'")
         sys.exit(1)
-        
+
     kb_path = Path(sys.argv[1]).resolve()
     if not kb_path.exists():
         print(f"Ошибка: Путь {kb_path} не существует.")
         sys.exit(1)
 
-    print(f"🤖 База знаний подключена: {kb_path}")
-    print("Задайте ваш вопрос (для выхода введите 'exit'):\n")
+    print(f"🤖 База знаний: {kb_path}")
+    if USE_PYMORPHY:
+        print("📚 Лемматизация: pymorphy2")
+    else:
+        print("📚 Лемматизация: встроенный стеммер")
+    print("Задайте вопрос (exit для выхода):\n")
 
     while True:
         try:
-            user_query = input("❓ Вы: ").strip()
-            if not user_query:
+            q = input("❓ Вы: ").strip()
+            if not q:
                 continue
-            if user_query.lower() in ['exit', 'quit', 'выход']:
+            if q.lower() in ('exit', 'quit', 'выход'):
                 break
 
-            print("🔍 Извлекаю корни ключевых слов...")
-            stems = get_search_keywords(user_query)
-            print(f"📂 Ищу в файлах по основам: {stems}...")
-            
-            context = search_files(kb_path, stems)
-            
-            if not context:
-                print("⚠ В локальных файлах ничего не найдено.")
-                context = "Информация в локальных файлах базы знаний по этим ключевым словам отсутствует."
+            print("🔍 Извлекаю ключевые слова...")
+            lemmas = get_search_keywords(q)
+            print(f"📂 Ключевые леммы: {lemmas}")
+
+            print("📄 Поиск по файлам...")
+            ctx_block = search_files(kb_path, lemmas, top_n=5)
+            if not ctx_block:
+                print("⚠ Ничего не найдено.")
+                ctx_block = "Информация в локальных файлах по этим ключевым словам отсутствует."
 
             print("🧠 Формирую ответ...")
-            
-            system_prompt = f"Ты полезный ИИ-ассистент. Ответь на вопрос пользователя, опираясь исключительно на предоставленный контекст из его личных файлов. Если информации нет, так и скажи.\n\nКОНТЕКСТ ИЗ ФАЙЛОВ:\n{context}"
+            # Улучшенный промпт – требование анализировать и отвечать по факту
+            prompt = f"""Ты — ИИ-ассистент, который помогает разобраться в личных заметках пользователя.
+Твоя задача — прочитать контекст из файлов и дать **прямой ответ на вопрос**, используя ТОЛЬКО факты из контекста.
+Если контекст содержит только вводные фразы или анонсы, а не конкретную информацию, так и напиши: «В найденных материалах содержательная информация отсутствует, есть только упоминание».
+Не пересказывай контекст дословно, не используй фразы вроде «в предоставленном контексте сказано». Просто дай ответ по существу.
 
-            response = ollama.generate(
-                model=MODEL_NAME,
-                prompt=f"Вопрос пользователя: {user_query}",
-                system=system_prompt,
-                options={"temperature": 0.2}
-            )
-            
-            ai_response = response['response']
-            print(f"\n🤖 Ответ:\n{ai_response}\n")
-            save_chat_history(kb_path, user_query, ai_response)
+КОНТЕКСТ:
+{ctx_block}
+
+ВОПРОС:
+{q}
+
+Твой ответ:"""
+            resp = ollama.generate(model=MODEL_NAME, prompt=prompt, options={"temperature": 0.2})
+            answer = resp['response']
+            print(f"\n🤖 Ответ:\n{answer}\n")
+            save_chat_history(kb_path, q, answer)
 
         except KeyboardInterrupt:
-            print("\nСессия прервана.")
+            print("\nДо свидания!")
             break
         except Exception as e:
-            print(f"Произошла ошибка в цикле: {e}")
+            print(f"Ошибка: {e}")
 
 if __name__ == "__main__":
     main()
