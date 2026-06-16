@@ -6,7 +6,7 @@ import ollama
 
 MODEL_NAME = "gemma4:e4b-it-q4_K_M"
 
-# ---------- Лемматизация (pymorphy2 или стеммер) ----------
+# ---------- Лемматизация (pymorphy2 или аварийный стеммер) ----------
 try:
     import pymorphy2
     try:
@@ -63,7 +63,7 @@ def lemmatize_text(text: str) -> list[str]:
             lemmas.append(l)
     return lemmas
 
-# ---------- Ключевые слова моделью ----------
+# ---------- Ключевые слова через модель ----------
 def get_search_keywords(user_query: str) -> list[str]:
     prompt = f"""Проанализируй вопрос пользователя. Выдели из него от 2 до 4 главных одиночных слов для поиска информации (существительные или глаголы в начальной форме).
 Игнорируй предлоги и общие слова (что, как, где, расскажи, лекция).
@@ -88,14 +88,14 @@ def get_search_keywords(user_query: str) -> list[str]:
     except Exception:
         return lemmatize_text(user_query)[:4]
 
-# ---------- Поиск (улучшен) ----------
-def search_files(kb_path: Path, query_lemmas: list[str], top_n=5) -> str:
+# ---------- Поиск на лету (без индексов) ----------
+def search_files(kb_path: Path, query_lemmas: list[str], top_n=10) -> str:
     if not query_lemmas:
         return ""
 
     found = []
 
-    for file_path in kb_path.rglob('*'):
+    for file_path in kb_path.rglob('*'):                # рекурсивный обход всех папок
         if file_path.suffix.lower() not in ['.md', '.txt']:
             continue
         if not file_path.is_file() or ".chat_history" in file_path.parts:
@@ -106,7 +106,7 @@ def search_files(kb_path: Path, query_lemmas: list[str], top_n=5) -> str:
         except Exception:
             continue
 
-        # Заголовок файла (первые 3 строки) – для контекста
+        # Заголовок файла (первые 3 строки)
         file_header = "".join(lines[:3]).strip() if len(lines) >= 3 else ""
 
         for idx, line in enumerate(lines):
@@ -122,12 +122,11 @@ def search_files(kb_path: Path, query_lemmas: list[str], top_n=5) -> str:
                 continue
 
             score = len(matched)
-            # Увеличиваем окно до ±5 строк
-            start = max(0, idx - 5)
-            end = min(len(lines), idx + 6)
+            # Расширенное окно: ±10 строк
+            start = max(0, idx - 10)
+            end = min(len(lines), idx + 11)
             snippet = "".join(lines[start:end]).strip()
 
-            # Добавляем заголовок файла, чтобы модель понимала источник
             full_context = f"Файл: {file_path.name}\nЗаголовок: {file_header}\n---\n{snippet}"
             found.append((score, full_context))
 
@@ -176,17 +175,17 @@ def main():
             print(f"📂 Ключевые леммы: {lemmas}")
 
             print("📄 Поиск по файлам...")
-            ctx_block = search_files(kb_path, lemmas, top_n=5)
+            ctx_block = search_files(kb_path, lemmas, top_n=10)    # до 10 фрагментов
             if not ctx_block:
                 print("⚠ Ничего не найдено.")
                 ctx_block = "Информация в локальных файлах по этим ключевым словам отсутствует."
 
             print("🧠 Формирую ответ...")
-            # Улучшенный промпт – требование анализировать и отвечать по факту
-            prompt = f"""Ты — ИИ-ассистент, который помогает разобраться в личных заметках пользователя.
-Твоя задача — прочитать контекст из файлов и дать **прямой ответ на вопрос**, используя ТОЛЬКО факты из контекста.
-Если контекст содержит только вводные фразы или анонсы, а не конкретную информацию, так и напиши: «В найденных материалах содержательная информация отсутствует, есть только упоминание».
-Не пересказывай контекст дословно, не используй фразы вроде «в предоставленном контексте сказано». Просто дай ответ по существу.
+            # Улучшенный промпт для развёрнутого ответа
+            prompt = f"""Ты — ИИ-ассистент. У тебя есть фрагменты из личных заметок пользователя.
+Проанализируй эти фрагменты и дай **развёрнутый, структурированный ответ** на вопрос.
+Опирайся на факты из контекста. Если информации мало, отметь это, но всё равно попробуй дать максимально осмысленный ответ на основе того, что есть.
+Не пересказывай контекст дословно, а объясни суть.
 
 КОНТЕКСТ:
 {ctx_block}
@@ -194,7 +193,7 @@ def main():
 ВОПРОС:
 {q}
 
-Твой ответ:"""
+Твой развёрнутый ответ:"""
             resp = ollama.generate(model=MODEL_NAME, prompt=prompt, options={"temperature": 0.2})
             answer = resp['response']
             print(f"\n🤖 Ответ:\n{answer}\n")
